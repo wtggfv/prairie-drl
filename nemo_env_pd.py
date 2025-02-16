@@ -177,21 +177,37 @@ This method calculates the observation vector for the agent, which includes info
             vel_target = state.info["velocity"]
             angvel_target = state.info["angvel"]
             cmd = jnp.array([vel_target[0], vel_target[1], angvel_target[0]])
+
+"""
+phase: Stores cyclic phase information for periodic movement patterns.
+cmd: Target velocities and angular velocities, used for commanded motion.
+"""
         else:
             phase = jnp.array([0., jnp.pi])
             cmd = jnp.array([0., 0., 0.])
 
         phase_clock = jnp.array([jnp.sin(phase[0]), jnp.cos(phase[0]),
                                  jnp.sin(phase[1]), jnp.cos(phase[1])])
-
+"""
+Encodes the phase as a cyclic signal (sine and cosine) to represent periodic movements.
+"""
 
         obs = jnp.concatenate([
             vel, angvel, grav_vec, position, velocity, prev_action, phase_clock, cmd
         ])
-
+"""
+vel, angvel: Linear and angular velocities of the pelvis.
+grav_vec: Gravity vector in pelvis frame.
+position, velocity: Generalized joint positions and velocities.
+prev_action: Previous action taken, useful for action continuity.
+phase_clock, cmd: Phase and command information for cyclic motion control.
+"""
         return obs
 
     def _get_obs_fk(
+      """
+This method uses forward kinematics to observe the robot's state with more detailed spatial information
+      """
             self, data0, data1, prev_action: jnp.ndarray, state=None
     ) -> jnp.ndarray:
         """Observes humanoid body position, velocities, and angles."""
@@ -230,7 +246,12 @@ This method calculates the observation vector for the agent, which includes info
         if state is not None:
             t = state.info["time"]
             rng = state.info["rng"]
-
+"""
+Adds random noise to observations to improve generalization and robustness.
+Noise is applied to:
+z: Pelvis height.
+locs: Relative joint positions.
+"""
             rng, key = jax.random.split(rng)
             sites_noise_0 = jax.random.uniform(key, shape=prev_sites.shape, minval=-0.1, maxval=0.1)
             prev_sites += sites_noise_0
@@ -261,6 +282,7 @@ This method calculates the observation vector for the agent, which includes info
             cmd = jnp.array([vel_target[0], vel_target[1], angvel_target[0]])
 
             phase = state.info["phase"]
+
         else:
 
             phase = jnp.array([0., jnp.pi])
@@ -268,6 +290,9 @@ This method calculates the observation vector for the agent, which includes info
 
         phase_clock = jnp.array([jnp.sin(phase[0]), jnp.cos(phase[0]),
                                  jnp.sin(phase[1]), jnp.cos(phase[1])])
+"""
+encodes phase information for cyclic motion control
+"""
         return jnp.concatenate([
             position,
             velocity,
@@ -280,7 +305,13 @@ This method calculates the observation vector for the agent, which includes info
     def reset(self, rng: jax.Array) -> State:
         vel, angvel, rng = self.makeCmd(rng)
         pipeline_state = self.pipeline_init(self.initial_state, jnp.zeros(self.nv))
-
+"""
+reset initializes the environment to a starting state.
+makeCmd generates the initial target velocities and angular velocities.
+pipeline_init sets up the physics pipeline with:
+initial_state: Starting pose.
+jnp.zeros(self.nv): Initial joint velocities set to zero.
+"""
         state_info = {
             "rng": rng,
             "time": jnp.zeros(1),
@@ -314,6 +345,10 @@ This method calculates the observation vector for the agent, which includes info
         #vel = vel + jnp.array([0.2, 0.0])
         angvel = jax.random.uniform(key2, shape=[1], minval=-0.7, maxval=0.7)
         return vel, angvel, rng
+      """
+vel: Target velocities in the x and y directions.
+angvel: Target angular velocity around the z-axis.
+      """
 
     def updateCmd(self, state):
         rng = state.info["rng"]
@@ -380,12 +415,22 @@ This method calculates the observation vector for the agent, which includes info
         reward_dict = {}
         data0 = state.pipeline_state
         min_z, max_z = (0.4, 0.7)
+      """
+reward_dict: Stores the individual reward components.
+data0: Previous pipeline state.
+min_z and max_z: Vertical position limits for the pelvis to maintain an upright posture.
+      """
         is_healthy = jnp.where(data.q[2] < min_z, 0.0, 1.0)
         is_healthy = jnp.where(data.q[2] > max_z, 0.0, is_healthy)
         #healthy_reward = 1.2 * is_healthy
         #reward_dict["healthy"] = healthy_reward
         reward_dict["termination"] = -500 * (1 - is_healthy)
-
+"""
+is_healthy: Checks if the pelvis height is within a safe range.
+0.4 < pelvis_z < 0.7 → Healthy (1.0)
+Otherwise → Unhealthy (0.0)
+termination: A large negative penalty (-500) is applied if the robot falls.
+"""
         vel_reward = self.velocityReward(state, data0, data)
         reward_dict["velocity"] = vel_reward * 2.0
 
