@@ -1,27 +1,17 @@
 import jax
 from brax.envs import PipelineEnv, State
-"""PipelineEnv is a base class for building custom environments, while State represents the environment's state, including observations, rewards, and other metrics.
-"""
 from jax import numpy as jnp
-"""jax.numpy is a NumPy-compatible API for numerical operations that supports automatic differentiation."""
 from brax.io import mjcf
-"""MJCF (MuJoCo XML format) is used to define the physical properties and structure of the robot. This module helps load the model from the XML file"""
 from brax import math
-"""Contains mathematical functions for vector operations, rotations, and other numerical calculations."""
+from networks.lstm import HIDDEN_SIZE, DEPTH
 import mujoco
-"""
-MuJoCo (Multi-Joint dynamics with Contact) is a physics engine used for accurate simulation of physical systems, especially for robotics and biomechanics. 
-It provides realistic contact dynamics and joint control
-"""
+
 import rewards
 
 
 DS_PROP = 0.1
 BU_PROP = 0.5
-"""
-DS_PROP (Double Support Proportion): The fraction of the gait cycle where both feet are in contact with the ground.
-BU_PROP (Body Upright Proportion): Likely used to ensure the robot remains upright during a specific portion of the gait.
-"""
+
 
 metrics_dict = {
                    'reward': 0.0,
@@ -41,64 +31,32 @@ metrics_dict = {
                     'angvel_z': 0.0,
                     'feet_orien': 0.0,
                     'feet_slip_ang': 0.0}
-"""
-reward: Total reward accumulated in a step.
-flatfoot: Rewards stable foot contact with the ground.
-periodic: Encourages periodic gait cycles.
-upright: Rewards maintaining an upright posture.
-limit: Penalizes exceeding joint limits.
-feet_z and feet_zd: Track the z-coordinate and vertical velocity of the feet.
-termination: Flags termination events (e.g., falls).
-velocity, vel_z: Track horizontal and vertical velocities.
-energy: Measures energy consumption.
-angvel_xy, angvel_z: Track angular velocities.
-action_rate: Penalizes abrupt changes in actions.
-feet_slip, feet_slip_ang: Penalize slipping or rotational instability of the feet.
-feet_orien: Rewards maintaining the correct foot orientation.
-"""
+
 class NemoEnv(PipelineEnv):
     def __init__(self):
         model = mujoco.MjModel.from_xml_path("nemo2/scene.xml")
-"""
-loads the MuJoCo XML file describing the robot's physical structure and properties.
-"""
+
         model.opt.solver = mujoco.mjtSolver.mjSOL_CG
-"""
-Conjugate Gradient solver for faster convergence
-"""
         model.opt.iterations = 6
         model.opt.ls_iterations = 6
-"""
-Control the number of solver iterations, balancing accuracy and computational cost.
-"""
+
         self.model = model
 
         system = mjcf.load_model(model)
-"""
-mjcf.load_model: Converts the MuJoCo model into a Brax system
-"""
+
         n_frames = 10
-"""
-n_frames = 10: Sets the number of frames for rendering smooth animations
-"""
+
         super().__init__(sys = system,
             backend='mjx',
             n_frames = n_frames
         )
 
         self.initial_state = jnp.array(system.mj_model.keyframe('stand').qpos)
-"""
-initial_state: Loads the robot's initial pose from the keyframe labeled "stand" in the XML
-"""
         self.nv = system.nv
         self.nu = system.nu
         self.control_range = system.actuator_ctrlrange
         self.joint_limit = jnp.array(model.jnt_range)
-"""
-nv and nu: Represent the number of generalized velocities and controls (actuators) in the system.
-control_range: Stores the control range for each actuator.
-joint_limit: Stores the joint angle limits.
-"""
+
         self.pelvis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'pelvis')
         self.pelvis_b_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'pelvis_back')
         self.pelvis_f_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'pelvis_front')
@@ -120,10 +78,7 @@ joint_limit: Stores the joint angle limits.
         self.left_geom_id = mujoco.mj_name2id(system.mj_model, mujoco.mjtObj.mjOBJ_GEOM, "left_foot")
 
 
-    def _get_obs(self, data0, data1, prev_action: jnp.ndarray, state = None):
-      """
-This method calculates the observation vector for the agent, which includes information about the robot's position, velocity, rotation, and other relevant state variables.
-      """
+    def _get_obs(self, data0, data1, state = None):
         inv_pelvis_rot = math.quat_inv(data1.x.rot[self.pelvis_id - 1])
         vel = data1.xd.vel[self.pelvis_id - 1]
         angvel = data1.xd.ang[self.pelvis_id - 1]
@@ -177,141 +132,28 @@ This method calculates the observation vector for the agent, which includes info
             vel_target = state.info["velocity"]
             angvel_target = state.info["angvel"]
             cmd = jnp.array([vel_target[0], vel_target[1], angvel_target[0]])
-
-"""
-phase: Stores cyclic phase information for periodic movement patterns.
-cmd: Target velocities and angular velocities, used for commanded motion.
-"""
+            carry = state.info["lstm_carry"]
+            prev_action = state.info["prev_action"]
         else:
             phase = jnp.array([0., jnp.pi])
             cmd = jnp.array([0., 0., 0.])
+            carry = jnp.zeros([HIDDEN_SIZE * DEPTH * 2])
+            prev_action = jnp.zeros(self.nu)
 
         phase_clock = jnp.array([jnp.sin(phase[0]), jnp.cos(phase[0]),
                                  jnp.sin(phase[1]), jnp.cos(phase[1])])
-"""
-Encodes the phase as a cyclic signal (sine and cosine) to represent periodic movements.
-"""
 
-        obs = jnp.concatenate([
+
+        obs = jnp.concatenate([ carry,
             vel, angvel, grav_vec, position, velocity, prev_action, phase_clock, cmd
         ])
-"""
-vel, angvel: Linear and angular velocities of the pelvis.
-grav_vec: Gravity vector in pelvis frame.
-position, velocity: Generalized joint positions and velocities.
-prev_action: Previous action taken, useful for action continuity.
-phase_clock, cmd: Phase and command information for cyclic motion control.
-"""
+
         return obs
-
-    def _get_obs_fk(
-      """
-This method uses forward kinematics to observe the robot's state with more detailed spatial information
-      """
-            self, data0, data1, prev_action: jnp.ndarray, state=None
-    ) -> jnp.ndarray:
-        """Observes humanoid body position, velocities, and angles."""
-
-        def getCoords(data_):
-            global_pos = data_.x.pos[self.pelvis_id + 1:, :]
-            center = data_.x.pos[self.pelvis_id, :]
-            local_pos = global_pos - center[None, :]
-            local_pos = local_pos.flatten()
-            # sites
-            lp1 = data_.site_xpos[self.left_foot_s1] - center
-            lp2 = data_.site_xpos[self.left_foot_s2] - center
-            lp3 = data_.site_xpos[self.left_foot_s3] - center
-            rp1 = data_.site_xpos[self.right_foot_s1] - center
-            rp2 = data_.site_xpos[self.right_foot_s2] - center
-            rp3 = data_.site_xpos[self.right_foot_s3] - center
-            head = data_.site_xpos[self.head_id] - center
-            pel_front = data_.site_xpos[self.pelvis_f_id] - center
-            com_offset = (data_.subtree_com[1] - center).flatten()
-            local_sites = jnp.concatenate([local_pos, lp1, lp2, lp3, rp1, rp2, rp3, head, pel_front, com_offset],
-                                          axis=0)
-            return local_sites
-
-        position = data1.qpos
-        prev_sites = getCoords(data0)
-        current_sites = getCoords(data1)
-        velocity = data1.qvel * 0.05
-        # l_grf, r_grf = self.determineGRF(data1)
-        # external_contact_forces are excluded
-        angvel = data1.xd.ang[self.pelvis_id, :] * 0.25
-        com0 = data1.subtree_com[0]
-        com1 = data1.subtree_com[1]
-        com_vel = (com1 - com0) / self.dt
-        com_vel = com_vel * 2
-        z = data1.x.pos[self.pelvis_id, 2:3]
-        if state is not None:
-            t = state.info["time"]
-            rng = state.info["rng"]
-"""
-Adds random noise to observations to improve generalization and robustness.
-Noise is applied to:
-z: Pelvis height.
-locs: Relative joint positions.
-"""
-            rng, key = jax.random.split(rng)
-            sites_noise_0 = jax.random.uniform(key, shape=prev_sites.shape, minval=-0.1, maxval=0.1)
-            prev_sites += sites_noise_0
-
-            rng, key = jax.random.split(rng)
-            sites_noise_1 = jax.random.uniform(key, shape=prev_sites.shape, minval=-0.1, maxval=0.1)
-            current_sites += sites_noise_1
-
-            rng, key = jax.random.split(rng)
-            position_noise = jax.random.uniform(key, shape=position.shape, minval=-0.1, maxval=0.1)
-            position += position_noise
-
-            rng, key = jax.random.split(rng)
-            velocity_noise = jax.random.uniform(key, shape=velocity.shape, minval=-0.5, maxval=0.5)
-            velocity += velocity_noise * 0.05
-
-            rng, key = jax.random.split(rng)
-            angvel_noise = jax.random.uniform(key, shape=angvel.shape, minval=-0.4, maxval=0.4)
-            angvel += angvel_noise * 0.25
-
-            rng, key = jax.random.split(rng)
-            vel_noise = jax.random.uniform(key, shape=com_vel.shape, minval=-0.1, maxval=0.1)
-            com_vel += vel_noise * 2.0
-            state.info["rng"] = rng
-
-            vel_target = state.info["velocity"]
-            angvel_target = state.info["angvel"]
-            cmd = jnp.array([vel_target[0], vel_target[1], angvel_target[0]])
-
-            phase = state.info["phase"]
-
-        else:
-
-            phase = jnp.array([0., jnp.pi])
-            cmd = jnp.array([0, 0, 0.])
-
-        phase_clock = jnp.array([jnp.sin(phase[0]), jnp.cos(phase[0]),
-                                 jnp.sin(phase[1]), jnp.cos(phase[1])])
-"""
-encodes phase information for cyclic motion control
-"""
-        return jnp.concatenate([
-            position,
-            velocity,
-            angvel,
-            com_vel,
-            prev_sites, current_sites,
-            prev_action, phase_clock, z, cmd
-        ])
 
     def reset(self, rng: jax.Array) -> State:
         vel, angvel, rng = self.makeCmd(rng)
         pipeline_state = self.pipeline_init(self.initial_state, jnp.zeros(self.nv))
-"""
-reset initializes the environment to a starting state.
-makeCmd generates the initial target velocities and angular velocities.
-pipeline_init sets up the physics pipeline with:
-initial_state: Starting pose.
-jnp.zeros(self.nv): Initial joint velocities set to zero.
-"""
+
         state_info = {
             "rng": rng,
             "time": jnp.zeros(1),
@@ -320,11 +162,13 @@ jnp.zeros(self.nv): Initial joint velocities set to zero.
             "prev_action": jnp.zeros(self.nu),
             "energy_hist": jnp.zeros([100, 12]),
             "phase": jnp.array([0, jnp.pi]),
-            "phase_period": 1.0
+            "phase_period": 1.0,
+            "lstm_carry": jnp.zeros([HIDDEN_SIZE * DEPTH * 2])
         }
         metrics = metrics_dict.copy()
 
-        obs = self._get_obs(pipeline_state, pipeline_state, jnp.zeros(self.nu))
+        obs = self._get_obs(pipeline_state, pipeline_state)
+        state_info["lstm_carry"] = obs[: 2 * HIDDEN_SIZE * DEPTH]
         reward, done, zero = jnp.zeros(3)
         state = State(
             pipeline_state=pipeline_state,
@@ -341,14 +185,10 @@ jnp.zeros(self.nv): Initial joint velocities set to zero.
         rng, key2 = jax.random.split(rng)
 
         vel = jax.random.uniform(key1, shape=[2], minval = -1, maxval = 1)
-        vel = vel * jnp.array([0.3, 0.3])
+        vel = vel * jnp.array([0.4, 0.4])
         #vel = vel + jnp.array([0.2, 0.0])
         angvel = jax.random.uniform(key2, shape=[1], minval=-0.7, maxval=0.7)
         return vel, angvel, rng
-      """
-vel: Target velocities in the x and y directions.
-angvel: Target angular velocity around the z-axis.
-      """
 
     def updateCmd(self, state):
         rng = state.info["rng"]
@@ -370,10 +210,21 @@ angvel: Target angular velocity around the z-axis.
         pos_sp = ((pos_t + 1) * (top_limit - bottom_limit) / 2 + bottom_limit)
 
         return jnp.concatenate([pos_sp, vel_sp])
-    #return pos_sp
+
+    def zeroStates(self, state):
+        rng = state.info["rng"]
+        rng, key = jax.random.split(rng)
+        state.info["rng"] = rng
+        rand = jax.random.uniform(key, shape = [1])
+        prob = self.dt / 5
+        y = jnp.where(rand[0] < prob, 0, 1)
+        state.info["lstm_carry"] = state.info["lstm_carry"] * y
+        return
 
     def step(self, state: State, action: jnp.ndarray):
-        scaled_action = self.tanh2Action(action)
+        raw_action = action[2 * HIDDEN_SIZE * DEPTH:]
+        carry_state = action[:2 * HIDDEN_SIZE * DEPTH]
+        scaled_action = self.tanh2Action(raw_action)
 
         #apply noise to scaled action
         pos_action = scaled_action[scaled_action.shape[0]//2:]
@@ -396,17 +247,20 @@ angvel: Target angular velocity around the z-axis.
         data1 = self.pipeline_step(data0, scaled_action)
 
         contact = rewards.feet_contact(data1, self.floor_id, self.left_geom_id, self.right_geom_id)
-        reward, done = self.rewards(state, data1, action, contact)
+        reward, done = self.rewards(state, data1, raw_action, contact)
 
         state.info["time"] += self.dt
-        state.info["prev_action"] = action
+        state.info["prev_action"] = raw_action
+        state.info["lstm_carry"] = carry_state
 
         state.info["phase"] += 2 * jnp.pi * self.dt / state.info["phase_period"]
         state.info["phase"] = jnp.mod(state.info["phase"], jnp.pi * 2)
 
+        self.zeroStates(state)
+
         self.updateCmd(state)
 
-        obs = self._get_obs(data0, data1, action, state = state)
+        obs = self._get_obs(data0, data1, state = state)
         return state.replace(
             pipeline_state = data1, obs=obs, reward=reward, done=done
         )
@@ -415,22 +269,12 @@ angvel: Target angular velocity around the z-axis.
         reward_dict = {}
         data0 = state.pipeline_state
         min_z, max_z = (0.4, 0.7)
-      """
-reward_dict: Stores the individual reward components.
-data0: Previous pipeline state.
-min_z and max_z: Vertical position limits for the pelvis to maintain an upright posture.
-      """
         is_healthy = jnp.where(data.q[2] < min_z, 0.0, 1.0)
         is_healthy = jnp.where(data.q[2] > max_z, 0.0, is_healthy)
         #healthy_reward = 1.2 * is_healthy
         #reward_dict["healthy"] = healthy_reward
         reward_dict["termination"] = -500 * (1 - is_healthy)
-"""
-is_healthy: Checks if the pelvis height is within a safe range.
-0.4 < pelvis_z < 0.7 → Healthy (1.0)
-Otherwise → Unhealthy (0.0)
-termination: A large negative penalty (-500) is applied if the robot falls.
-"""
+
         vel_reward = self.velocityReward(state, data0, data)
         reward_dict["velocity"] = vel_reward * 2.0
 
